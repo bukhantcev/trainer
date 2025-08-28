@@ -836,6 +836,8 @@ async def plan_back(callback: CallbackQuery):
 async def input_actual_reps(message: Message):
     tg_id = message.from_user.id
     pending = EXPECT_INPUT.get(tg_id)
+    # Compute expected count for validation
+    expected_cnt = len(pending.get("set_indices", [])) if pending else 0
     if not pending:
         return  # not waiting for reps
 
@@ -847,13 +849,27 @@ async def input_actual_reps(message: Message):
         if not p:
             continue
         try:
-            reps.append(int(p))
+            val = int(p)
         except ValueError:
             await message.answer("Только целые числа через пробел. Пример: 8 8 7 6")
             return
+        if val < 0:
+            await message.answer("Числа должны быть неотрицательными. Пример: 8 8 7 6")
+            return
+        reps.append(val)
 
     if not reps:
         await message.answer("Ничего не понял. Пришли числа через пробел, напр.: 8 8 7 6")
+        return
+
+    # Validate count matches number of sets expected
+    if expected_cnt and len(reps) != expected_cnt:
+        tips = (
+            "Количество значений не совпадает с числом подходов.\n"
+            f"Ожидаю: <b>{expected_cnt}</b> чисел, ты прислал: <b>{len(reps)}</b>.\n"
+            "Пришли повторы через пробел, строго по порядку сетов. Пример: 8 8 7 6"
+        )
+        await message.answer(tips, parse_mode="HTML")
         return
 
     name = pending["name"]
