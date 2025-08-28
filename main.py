@@ -37,7 +37,8 @@ dp = Dispatcher()
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Посмотреть профиль")],
-        [KeyboardButton(text="Новая тренировка"), KeyboardButton(text="Новая AI тренировка")]
+        [KeyboardButton(text="Новая тренировка"), KeyboardButton(text="Новая AI тренировка")],
+        [KeyboardButton(text="Показать тренировки")]
     ],
     resize_keyboard=True
 )
@@ -133,6 +134,13 @@ def init_db():
         conn.execute("ALTER TABLE exercises ADD COLUMN date TEXT")
     except sqlite3.OperationalError:
         pass
+    # Ensure tg_id exists in workouts for old DBs and add indexes
+    try:
+        conn.execute("ALTER TABLE workouts ADD COLUMN tg_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_workouts_tg_date ON workouts(tg_id, date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_exercises_workout ON exercises(workout_id)")
 
     conn.commit()
     conn.close()
@@ -332,6 +340,45 @@ async def view_profile(message: Message):
     row = conn.execute("SELECT name, age, height, weight, goal, experience, gender FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
     conn.close()
     await message.answer(format_profile_card(row), parse_mode="HTML", reply_markup=profile_inline_kb())
+
+
+# Handler to list recent workouts for the current user
+@dp.message(F.text == "Показать тренировки")
+async def list_workouts(message: Message):
+    tg_id = message.from_user.id
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, date
+        FROM workouts
+        WHERE tg_id = ?
+        ORDER BY date DESC, id DESC
+        LIMIT 10
+        """,
+        (tg_id,)
+    )
+    rows = cur.fetchall()
+    if not rows:
+        conn.close()
+        await message.answer("У тебя ещё нет сохранённых тренировок.")
+        return
+
+    buttons = []
+    for r in rows:
+        wid = r["id"]; wdate = r["date"]
+        # count distinct exercises for this workout
+        cnt_row = conn.execute(
+            "SELECT COUNT(DISTINCT name) AS c FROM exercises WHERE workout_id = ?",
+            (wid,)
+        ).fetchone()
+        cnt = cnt_row["c"] if cnt_row else 0
+        label = f"{wdate} — {cnt} упр."
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"workouts:open:{wid}")])
+    conn.close()
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer("Последние тренировки:", reply_markup=kb)
 
 
 # Callback handler for profile:edit
@@ -715,12 +762,13 @@ async def plan_open_exercise(callback: CallbackQuery):
     if workout_id:
         cur.execute(
             """
-            SELECT set_index, weight, target_reps, actual_reps
-            FROM exercises
-            WHERE workout_id = ? AND name = ?
-            ORDER BY set_index ASC
+            SELECT e.set_index, e.weight, e.target_reps, e.actual_reps
+            FROM exercises e
+            JOIN workouts w ON w.id = e.workout_id
+            WHERE e.workout_id = ? AND w.tg_id = ? AND e.name = ?
+            ORDER BY e.set_index ASC
             """,
-            (workout_id, name)
+            (workout_id, tg_id, name)
         )
     else:
         # fallback by date if workout_id not cached
@@ -769,6 +817,75 @@ async def plan_open_exercise(callback: CallbackQuery):
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
         await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+# Handler to open a selected workout and show its exercises grouped (with status icons and delete button)
+@dp.callback_query(F.data.startswith("workouts:open:"))
+async def workouts_open(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    data = callback.data
+    try:
+        wid = int(data.split(":")[-1])
+    except Exception:
+        await callback.answer("Ошибка id тренировки", show_alert=False)
+        return
+
+    conn = get_connection()
+    cur = conn.cursor()
+    # verify ownership and get date
+    wrow = cur.execute(
+        "SELECT id, date FROM workouts WHERE id = ? AND tg_id = ?",
+        (wid, tg_id)
+    ).fetchone()
+    if not wrow:
+        conn.close()
+        await callback.answer("Нет доступа к этой тренировке", show_alert=False)
+        return
+
+    # distinct exercise names
+    cur.execute(
+        """
+        SELECT DISTINCT e.name
+        FROM exercises e
+        WHERE e.workout_id = ?
+        ORDER BY e.name COLLATE NOCASE
+        """,
+        (wid,)
+    )
+    names = [row[0] for row in cur.fetchall()]
+
+    # Build buttons with status icons
+    rows = []
+    for i, name in enumerate(names, start=1):
+        cur.execute(
+            """
+            SELECT e.set_index, e.target_reps, e.actual_reps
+            FROM exercises e
+            JOIN workouts w ON w.id = e.workout_id
+            WHERE e.workout_id = ? AND w.tg_id = ? AND e.name = ?
+            ORDER BY e.set_index ASC
+            """,
+            (wid, tg_id, name)
+        )
+        rset = cur.fetchall()
+        icon = exercise_status_icon(rset)
+        label = f"{icon} {name}" if icon else name
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"plan:ex:{i}")])
+
+    conn.close()
+
+    # cache for callbacks
+    EX_CACHE[tg_id] = {"date": wrow["date"], "names": names, "workout_id": wid}
+
+    # add delete button
+    rows.append([InlineKeyboardButton(text="🗑 Удалить тренировку", callback_data=f"plan:del:{wid}")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    try:
+        await callback.message.edit_text(f"Тренировка за {wrow['date']}:", reply_markup=kb)
+    except Exception:
+        await callback.message.answer(f"Тренировка за {wrow['date']}:", reply_markup=kb)
     await callback.answer()
 
 
@@ -876,12 +993,13 @@ async def plan_back(callback: CallbackQuery):
         for i, name in enumerate(names, start=1):
             cur.execute(
                 """
-                SELECT set_index, target_reps, actual_reps
-                FROM exercises
-                WHERE workout_id = ? AND name = ?
-                ORDER BY set_index ASC
+                SELECT e.set_index, e.target_reps, e.actual_reps
+                FROM exercises e
+                JOIN workouts w ON w.id = e.workout_id
+                WHERE e.workout_id = ? AND w.tg_id = ? AND e.name = ?
+                ORDER BY e.set_index ASC
                 """,
-                (wid, name)
+                (wid, tg_id, name)
             )
             rset = cur.fetchall()
             icon = exercise_status_icon(rset)
@@ -1090,11 +1208,13 @@ async def input_actual_reps(message: Message):
     if workout_id:
         cur.execute(
             """
-            SELECT id, set_index FROM exercises
-            WHERE workout_id = ? AND name = ?
-            ORDER BY set_index ASC
+            SELECT e.set_index, e.weight, e.target_reps, e.actual_reps
+            FROM exercises e
+            JOIN workouts w ON w.id = e.workout_id
+            WHERE e.workout_id = ? AND w.tg_id = ? AND e.name = ?
+            ORDER BY e.set_index ASC
             """,
-            (workout_id, name)
+            (workout_id, tg_id, name)
         )
     else:
         cur.execute(
