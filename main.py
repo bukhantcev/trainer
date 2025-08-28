@@ -17,6 +17,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from openai import OpenAI
 from prompt import PROMPT
+from local_planer import generate_plan
 
 
 # --- Init ---
@@ -35,7 +36,8 @@ dp = Dispatcher()
 
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Посмотреть профиль"), KeyboardButton(text="Новая тренировка")]
+        [KeyboardButton(text="Посмотреть профиль")],
+        [KeyboardButton(text="Новая тренировка"), KeyboardButton(text="Новая AI тренировка")]
     ],
     resize_keyboard=True
 )
@@ -64,7 +66,8 @@ def init_db():
             height INTEGER,
             weight INTEGER,
             goal TEXT,
-            experience TEXT
+            experience TEXT,
+            gender TEXT
         )
         """
     )
@@ -87,6 +90,14 @@ def init_db():
         pass
     try:
         conn.execute("ALTER TABLE users ADD COLUMN dips_reps INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN gender TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN ohp_max_kg INTEGER")
     except sqlite3.OperationalError:
         pass
 
@@ -160,6 +171,7 @@ def format_profile_card(row: sqlite3.Row | None) -> str:
     weight = row.get("weight") if isinstance(row, dict) else row["weight"]
     goal = row.get("goal") if isinstance(row, dict) else row["goal"]
     exp = row.get("experience") if isinstance(row, dict) else row["experience"]
+    gender = row.get("gender") if isinstance(row, dict) else row["gender"]
     def show(v):
         return str(v) if v not in (None, "") else "не указано"
     return (
@@ -168,6 +180,7 @@ def format_profile_card(row: sqlite3.Row | None) -> str:
         f"Возраст: {show(age)}\n"
         f"Рост: {show(height)}\n"
         f"Вес: {show(weight)}\n"
+        f"Пол: {show(gender)}\n"
         f"Цель: {show(goal)}\n"
         f"Опыт: {show(exp)}"
     )
@@ -189,6 +202,7 @@ def parse_profile_update(text: str) -> dict:
         'weight': re.compile(r'вес\s+(\d+)', re.I),
         'goal': re.compile(r'цель\s+(.+)', re.I),
         'experience': re.compile(r'опыт\s+(.+)', re.I),
+        'gender': re.compile(r'пол\s+(.+)', re.I),
     }
 
     # Normalize goal values
@@ -207,6 +221,10 @@ def parse_profile_update(text: str) -> dict:
         'продвинутый': 'продвинутый',
     }
 
+    gender_map = {
+        'м': 'мужской', 'муж': 'мужской', 'мужчина': 'мужской', 'мужской': 'мужской',
+        'ж': 'женский', 'жен': 'женский', 'женщина': 'женский', 'женский': 'женский',
+    }
     for part in parts:
         part = part.strip()
         for key, pattern in patterns.items():
@@ -225,6 +243,14 @@ def parse_profile_update(text: str) -> dict:
                     val_lower = val.lower()
                     for k, v in exp_map.items():
                         if k in val_lower:
+                            val = v
+                            break
+                    else:
+                        val = val_lower
+                elif key == 'gender':
+                    val_lower = val.lower()
+                    for k, v in gender_map.items():
+                        if k == val_lower or k in val_lower:
                             val = v
                             break
                     else:
@@ -255,7 +281,8 @@ def parse_profile_update(text: str) -> dict:
 # Inline keyboard for profile editing
 def profile_inline_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Изменить", callback_data="profile:edit")]
+        [InlineKeyboardButton(text="Изменить", callback_data="profile:edit")],
+        [InlineKeyboardButton(text="Обновить анкету", callback_data="profile:refresh_form")]
     ])
 
 
@@ -269,6 +296,7 @@ class OnboardFSM(StatesGroup):
     squat = State()
     pullups = State()
     deadlift = State()
+    ohp = State()  # армейский жим (подъём штанги стоя)
     dips = State()
 
 
@@ -301,7 +329,7 @@ async def cmd_start(message: Message, state: FSMContext):
 async def view_profile(message: Message):
     tg_id = message.from_user.id
     conn = get_connection()
-    row = conn.execute("SELECT name, age, height, weight, goal, experience FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
+    row = conn.execute("SELECT name, age, height, weight, goal, experience, gender FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
     conn.close()
     await message.answer(format_profile_card(row), parse_mode="HTML", reply_markup=profile_inline_kb())
 
@@ -312,12 +340,37 @@ async def edit_profile_cb(callback: CallbackQuery, state: FSMContext):
     await callback.answer("Режим редактирования профиля", show_alert=False)
     await state.set_state(ProfileFSM.wait_input)
     await callback.message.answer(
-        "Напиши, что изменить, в формате: Имя Алеша, Возраст 39, Рост 173, Вес 82, Цель сила, Опыт новичок.\n"
+        "Напиши, что изменить, в формате: Имя Алеша, Возраст 39, Рост 173, Вес 82, Цель сила, Опыт новичок, Пол мужской.\n"
         "Можно прислать только нужные поля.\n\n"
         "Варианты цели: сила, масса, сушка, общая форма.\n"
         "Варианты опыта: новичок, средний, продвинутый.\n"
-        "Рост и вес вводи целыми числами."
+        "Пол: мужской/женский. Рост и вес вводи целыми числами."
     )
+
+
+# Callback handler for profile:refresh_form
+@dp.callback_query(F.data == "profile:refresh_form")
+async def profile_refresh_form(callback: CallbackQuery, state: FSMContext):
+    tg_id = callback.from_user.id
+    conn = get_connection()
+    cur = conn.cursor()
+    ob = cur.execute(
+        "SELECT bench_max_kg, squat_max_kg, pullups_reps, deadlift_max_kg, ohp_max_kg, dips_reps FROM users WHERE tg_id = ?",
+        (tg_id,)
+    ).fetchone()
+    conn.close()
+    prev = dict(ob) if ob else {}
+    lines = ["Обновим анкету. Пришли новые значения по очереди на вопросы.\n",
+             "Текущие значения:"]
+    lines.append(f"Жим лёжа: {prev.get('bench_max_kg', '—')} кг")
+    lines.append(f"Присед со штангой: {prev.get('squat_max_kg', '—')} кг")
+    lines.append(f"Подтягивания: {prev.get('pullups_reps', '—')} повт.")
+    lines.append(f"Становая тяга: {prev.get('deadlift_max_kg', '—')} кг")
+    lines.append(f"Армейский жим (стоя): {prev.get('ohp_max_kg', '—')} кг")
+    lines.append(f"Брусья: {prev.get('dips_reps', '—')} повт.")
+    await state.set_state(OnboardFSM.bench)
+    await callback.message.answer("\n".join(lines) + "\n\nЖим лёжа — твой максимальный вес (кг)? Введи целое число.")
+    await callback.answer()
 
 
 @dp.message(ProfileFSM.wait_input)
@@ -338,7 +391,7 @@ async def profile_update_input(message: Message, state: FSMContext):
     cur.execute(query, values)
     conn.commit()
     # Fetch updated row
-    row = cur.execute("SELECT name, age, height, weight, goal, experience FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
+    row = cur.execute("SELECT name, age, height, weight, goal, experience, gender FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
     conn.close()
     await state.clear()
     await message.answer(format_profile_card(row), parse_mode="HTML", reply_markup=profile_inline_kb())
@@ -410,6 +463,24 @@ async def onboard_deadlift(message: Message, state: FSMContext):
     cur.execute("UPDATE users SET deadlift_max_kg = ? WHERE tg_id = ?", (val, tg_id))
     conn.commit()
     conn.close()
+    await state.set_state(OnboardFSM.ohp)
+    await message.answer("Подъём штанги стоя (армейский жим) — максимальный вес (кг)? Введи целое число.")
+
+
+# Handler for OHP
+@dp.message(OnboardFSM.ohp)
+async def onboard_ohp(message: Message, state: FSMContext):
+    tg_id = message.from_user.id
+    try:
+        val = int(message.text.strip())
+    except ValueError:
+        await message.answer("Пожалуйста, введи целое число. Подъём штанги стоя (армейский жим) — максимальный вес (кг)?")
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET ohp_max_kg = ? WHERE tg_id = ?", (val, tg_id))
+    conn.commit()
+    conn.close()
     await state.set_state(OnboardFSM.dips)
     await message.answer("Отжимания на брусьях — сколько повторений? Введи целое число.")
 
@@ -431,8 +502,8 @@ async def onboard_dips(message: Message, state: FSMContext):
     await message.answer("Спасибо! Данные сохранены. Выбирай действие ниже.", reply_markup=main_kb)
 
 
-@dp.message(F.text == "Новая тренировка")
-async def new_training_collect(message: Message):
+@dp.message(F.text == "Новая AI тренировка")
+async def new_training_ai(message: Message):
     tg_id = message.from_user.id
     conn = get_connection()
     cur = conn.cursor()
@@ -504,7 +575,7 @@ async def new_training_collect(message: Message):
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     if not OPENAI_API_KEY:
         print("[OpenAI] ERROR: OPENAI_API_KEY is not set")
-        await message.answer("Ошибка OpenAI: проверь ключ в .env")
+        await message.answer("Ошибка OpenAI: проверь ключ в .env (для AI-плана)")
         return
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
@@ -830,6 +901,143 @@ async def plan_back(callback: CallbackQuery):
         await callback.message.answer("Упражнения на сегодня:", reply_markup=kb)
     await callback.answer()
 
+@dp.message(F.text == "Новая тренировка")
+async def new_training_local(message: Message):
+    print('erer')
+    tg_id = message.from_user.id
+    conn = get_connection()
+    cur = conn.cursor()
+    # Fetch user core info (exclude onboarding strength metrics)
+    user_row = cur.execute(
+        "SELECT name, age, height, weight, goal, experience FROM users WHERE tg_id = ?",
+        (tg_id,)
+    ).fetchone()
+    user_info = dict(user_row) if user_row else {}
+
+    user_info_ru = {
+        "Имя": user_info.get("name"),
+        "Возраст": user_info.get("age"),
+        "Рост": user_info.get("height"),
+        "Вес": user_info.get("weight"),
+        "Цель": user_info.get("goal"),
+        "Опыт": user_info.get("experience"),
+    }
+
+    # Fetch last 30 days history
+    since = (datetime.now(timezone.utc).date() - timedelta(days=30)).strftime("%Y-%m-%d")
+    cur.execute(
+        """
+        SELECT w.date AS date, e.name AS exercise, e.set_index AS set_number,
+               e.weight AS weight, e.target_reps AS target_reps, e.actual_reps AS actual_reps
+        FROM workouts w
+        JOIN exercises e ON e.workout_id = w.id
+        WHERE w.tg_id = ? AND w.date >= ?
+        ORDER BY w.date ASC, w.id ASC, e.set_index ASC
+        """,
+        (tg_id, since)
+    )
+    history_rows = [dict(r) for r in cur.fetchall()]
+
+    history_ru = [
+        {
+            "дата": row["date"],
+            "упражнение": row["exercise"],
+            "подход": row["set_number"],
+            "вес": row["weight"],
+            "целевые_повторения": row["target_reps"],
+            "выполненные_повторения": row["actual_reps"],
+        }
+        for row in history_rows
+    ]
+
+    payload = {
+        "пользователь": user_info_ru,
+        "история": history_ru,
+    }
+
+    # If no history — include onboarding answers from profile
+    if not history_rows:
+        ob = cur.execute(
+            "SELECT bench_max_kg, squat_max_kg, pullups_reps, deadlift_max_kg, dips_reps, ohp_max_kg FROM users WHERE tg_id = ?",
+            (tg_id,)
+        ).fetchone()
+        onboarding_ru = {
+            "жим_лёжа_макс_кг": ob["bench_max_kg"],
+            "присед_макс_кг": ob["squat_max_kg"],
+            "подтягивания_повторы": ob["pullups_reps"],
+            "становая_макс_кг": ob["deadlift_max_kg"],
+            "брусья_повторы": ob["dips_reps"],
+            "ohp_max_kg": ob["ohp_max_kg"],
+        } if ob else {}
+        payload["анкета"] = onboarding_ru
+
+    conn.close()
+
+    # --- Generate plan locally
+    try:
+        plan_items = generate_plan(payload)
+    except Exception as e:
+        await message.answer(f"Локальный планировщик упал: {e}")
+        return
+
+    if plan_items:
+        # Create workout for today
+        today_iso = datetime.now(timezone.utc).date().strftime('%Y-%m-%d')
+        conn2 = get_connection()
+        cur2 = conn2.cursor()
+        cur2.execute(
+            "INSERT INTO workouts (tg_id, date, notes) VALUES (?, ?, ?)",
+            (tg_id, today_iso, 'auto from local_planer')
+        )
+        workout_id = cur2.lastrowid
+
+        # Insert exercises/sets
+        inserted = 0
+        for item in plan_items:
+            try:
+                name = item.get('Название упражнения')
+                set_number = int(item.get('Номер подхода')) if item.get('Номер подхода') is not None else None
+                weight = int(item.get('Вес')) if item.get('Вес') is not None else None
+                target_reps = int(item.get('Количество повторений')) if item.get('Количество повторений') is not None else None
+                if not name or set_number is None:
+                    continue
+                cur2.execute(
+                    """
+                    INSERT INTO exercises (workout_id, name, set_index, weight, target_reps, actual_reps, date)
+                    VALUES (?, ?, ?, ?, ?, NULL, ?)
+                    """,
+                    (workout_id, name, set_number, weight, target_reps, today_iso)
+                )
+                inserted += 1
+            except Exception as e_row:
+                print(f"[DB] Skip row error: {e_row} | row={item}")
+        conn2.commit()
+        conn2.close()
+
+        # --- Build exercise list for today and send as inline keyboard ---
+        conn3 = get_connection()
+        cur3 = conn3.cursor()
+        cur3.execute(
+            """
+            SELECT DISTINCT name FROM exercises
+            WHERE workout_id = ?
+            ORDER BY name COLLATE NOCASE
+            """,
+            (workout_id,)
+        )
+        names = [row[0] for row in cur3.fetchall()]
+        conn3.close()
+
+        if names:
+            EX_CACHE[tg_id] = {"date": today_iso, "names": names, "workout_id": workout_id}
+            rows = [[InlineKeyboardButton(text=name, callback_data=f"plan:ex:{i}")] for i, name in enumerate(names, start=1)]
+            rows.append([InlineKeyboardButton(text="🗑 Удалить тренировку", callback_data=f"plan:del:{workout_id}")])
+            kb = InlineKeyboardMarkup(inline_keyboard=rows)
+            await message.answer("Упражнения на сегодня (локальный план):", reply_markup=kb)
+        else:
+            await message.answer("План сохранён, но упражнений не найдено.")
+    else:
+        await message.answer("Локальный планировщик вернул пустой список.")
 
 # Handler to capture user's actual reps input and update DB
 @dp.message(F.text)
@@ -955,6 +1163,9 @@ async def input_actual_reps(message: Message):
     text = "\n".join(lines)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← Назад", callback_data="plan:back")]])
     await message.answer(f"Сохранил {cnt} значений.\n\n" + text, reply_markup=kb, parse_mode="HTML")
+
+
+
 
 
 
