@@ -14,6 +14,118 @@ def generate_plan(payload: Dict, today: Optional[str] = None) -> List[Dict]:
     user = payload.get("пользователь", {}) or {}
     history = payload.get("история", []) or []
     anketa = payload.get("анкета", {}) or {}
+    print(anketa)
+
+    # --- normalize anketa/user keys: lowercased, spaces->'_', 'ё'->'е', plus alias map
+    def _norm_dict(src: Dict) -> Dict:
+        nd = {}
+        for k, v in (src or {}).items():
+            kk = str(k).strip().lower()
+            kk = kk.replace(" ", "_").replace("-", "_").replace("ё", "е")
+            nd[kk] = v
+        # aliases -> canonical keys
+        alias_map = {
+            # bench
+            "жим_лежа_1пм": "жим_лежа_макс_кг",
+            "жим_штанги_лежа_макс": "жим_лежа_макс_кг",
+            "жим_штанги_лежа_макс_кг": "жим_лежа_макс_кг",
+            "bench_1rm": "bench_max_kg",
+            # close-grip bench (triceps 1RM proxy)
+            "жим_узким_хватом_макс_кг": "узкий_жим_макс_кг",
+            "узкий_жим_лежа_макс_кг": "узкий_жим_макс_кг",
+            "узкий_жим_1пм": "узкий_жим_макс_кг",
+            # squat
+            "присед_1пм": "присед_макс_кг",
+            # deadlift
+            "становая_1пм": "становая_макс_кг",
+            # ohp
+            "армейский_жим_1пм": "армейский_жим_макс_кг",
+            "жим_штанги_стоя_макс_кг": "армейский_жим_макс_кг",
+        }
+        for a, b in alias_map.items():
+            if a in nd and b not in nd:
+                nd[b] = nd[a]
+        return nd
+
+    user = _norm_dict(user)
+    anketa = _norm_dict(anketa)
+
+    # --- numeric coercion
+    def _to_int(x):
+        try:
+            if x is None:
+                return None
+            if isinstance(x, (int, float)):
+                return int(x)
+            s = str(x).strip().replace(",", ".")
+            f = float(s)
+            return int(round(f))
+        except Exception:
+            return None
+
+    # --- last record util already defined below, but we need a lightweight name list search here
+    def _last_record_for_any(names: List[str]) -> Optional[Dict]:
+        cand = []
+        for r in history:
+            rn = (r.get("упражнение") or "").lower()
+            if any(n.lower() == rn for n in names):
+                if r.get("дата"):
+                    cand.append(r)
+        if not cand:
+            return None
+        cand.sort(key=lambda x: (_to_date(x["дата"]), x.get("подход", 0)))
+        return cand[-1]
+
+    # --- estimate 1RM from history using Epley (w * (1 + reps/30))
+    def _estimate_1rm_from_history(names: List[str]) -> Optional[int]:
+        r = _last_record_for_any(names)
+        if not r:
+            return None
+        w = _to_int(r.get("вес"))
+        reps = _to_int(r.get("выполненные_повторения")) or _to_int(r.get("целевые_повторения"))
+        if w is None or reps is None or reps <= 0:
+            return None
+        return int(round(w * (1 + reps / 30.0)))
+
+    # --- Extract 1RM from anketa/user by aliases with history fallback
+    def _extract_1rm(alias_keys: List[str], hist_names: List[str]) -> Optional[int]:
+        # try anketa then user
+        for src in (anketa, user):
+            for k in alias_keys:
+                v = src.get(k)
+                iv = _to_int(v)
+                if iv is not None and iv > 0:
+                    return iv
+        # fallback from history
+        return _estimate_1rm_from_history(hist_names)
+
+    # aliases and canonical exercise names for history lookup
+    _BENCH_KEYS = ["жим_лежа_макс_кг", "bench_max_kg", "1пм_жим_лежа", "1rm_bench"]
+    _BENCH_NAMES = [
+        "жим штанги лежа",
+        "жим лежа (штанга)",
+    ]
+
+    _CGBP_KEYS = [
+        "узкий_жим_макс_кг",
+        "cgbp_max_kg",
+        "узкий_жим_штанги_лежа_макс_кг",
+        "жим_узким_хватом_макс_кг",
+        "узкий_жим_лежа_макс_кг",
+    ]
+    _CGBP_NAMES = [
+        "узкий жим штанги лежа",
+        "жим узким хватом",
+    ]
+
+    _SQUAT_KEYS = ["присед_макс_кг", "squat_max_kg", "1rm_squat", "1пм_присед"]
+    _SQUAT_NAMES = ["приседания со штангой"]
+
+    _DL_KEYS = ["становая_макс_кг", "deadlift_max_kg", "1rm_deadlift", "1пм_становая"]
+    _DL_NAMES = ["становая тяга", "становая тяга классическая (штанга)"]
+
+    _OHP_KEYS = ["ohp_max_kg", "армейский_жим_макс_кг", "1rm_ohp"]
+    _OHP_NAMES = ["жим штанги стоя", "армейский жим"]
 
     # --- утилиты даты
     def _to_date(s: str) -> _date:
@@ -21,10 +133,13 @@ def generate_plan(payload: Dict, today: Optional[str] = None) -> List[Dict]:
 
     # --- классификация упражнений по группам
     CHEST = "chest"; TRIS = "tris"; SHOULD = "should"; LEGS = "legs"; BACK = "back"; BICEPS = "biceps"; ABS = "abs"
-    PAIRS = [("back","biceps"), ("chest","tris"), ("should","legs")]
+    PAIRS = [("chest","tris"), ("should","legs"), ("back","biceps")]
+
+    def _norm_name(n: Optional[str]) -> str:
+        return (n or "").strip().lower().replace("ё", "е")
 
     def muscle_group(name: str) -> Optional[str]:
-        n = name.lower()
+        n = _norm_name(name)
         # грудь
         if any(k in n for k in ["жим штанги лежа", "жим гантелей", "жим штанги на наклонной", "сведение рук"]):
             return CHEST
@@ -49,7 +164,7 @@ def generate_plan(payload: Dict, today: Optional[str] = None) -> List[Dict]:
         return None
 
     # --- найти последнюю дату в истории и доминирующую пару групп на ней
-    next_pair_idx = 0
+    next_pair_idx = 1  # if history is empty, start with Legs+Shoulders ("should","legs")
     if history:
         # сгруппируем по дате
         by_date: Dict[str, List[Dict]] = defaultdict(list)
@@ -73,7 +188,7 @@ def generate_plan(payload: Dict, today: Optional[str] = None) -> List[Dict]:
             return sums[0][1]
         last_pair = _pair_of(groups_count)
         # выбрать следующую в цикле
-        idx_map = {("back","biceps"):0, ("chest","tris"):1, ("should","legs"):2}
+        idx_map = {("chest","tris"):0, ("should","legs"):1, ("back","biceps"):2}
         next_pair_idx = (idx_map.get(last_pair, 0) + 1) % 3
     target_pair = PAIRS[next_pair_idx]  # кортеж из ('back','biceps') и т.п.
 
@@ -81,7 +196,7 @@ def generate_plan(payload: Dict, today: Optional[str] = None) -> List[Dict]:
     def last_records_for_ex(ex_name: str) -> List[Dict]:
         ex = []
         for r in history:
-            if (r.get("упражнение") or "").lower() == ex_name.lower():
+            if _norm_name(r.get("упражнение")) == _norm_name(ex_name):
                 ex.append(r)
         ex.sort(key=lambda x: (_to_date(x["дата"]), x.get("подход", 0)))
         return ex
@@ -106,41 +221,69 @@ def generate_plan(payload: Dict, today: Optional[str] = None) -> List[Dict]:
         if not pct:  # ближайшее значение
             keys = sorted(PCT_BY_REPS.keys(), key=lambda k: abs(k-reps))
             pct = PCT_BY_REPS[keys[0]]
-        return max(0, int(round(one_rm * pct)))
+        return max(1, int(round(one_rm * pct)))
 
     # --- оценка стартового веса для конкретного упражнения
     def estimate_base_weight(ex_name: str, reps: int) -> Optional[int]:
-        n = ex_name.lower()
+        n = _norm_name(ex_name)
 
         # если в истории уже есть вес — используем его
         w_last, _, _ = last_weight_and_delta(ex_name)
         if isinstance(w_last, (int, float)):
             return int(w_last)
 
-        # отталкиваемся от анкеты
-        bench = anketa.get("жим_лёжа_макс_кг") or user.get("bench_max_kg")
-        squat = anketa.get("присед_макс_кг") or user.get("squat_max_kg")
-        deadl = anketa.get("становая_макс_кг") or user.get("deadlift_max_kg")
-        ohp   = anketa.get("ohp_max_кг") or anketa.get("ohp_max_kg") or user.get("ohp_max_kg")
+        # 1ПМ из анкеты / профиля
+        bench = _extract_1rm(_BENCH_KEYS, _BENCH_NAMES)
+        squat = _extract_1rm(_SQUAT_KEYS, _SQUAT_NAMES)
+        deadl = _extract_1rm(_DL_KEYS, _DL_NAMES)
+        ohp   = _extract_1rm(_OHP_KEYS, _OHP_NAMES)
 
-        if "жим штанги лежа" in n:
+        # НОВОЕ: используем 1ПМ узкого жима как якорь для трицепса
+        cgbp  = _extract_1rm(_CGBP_KEYS, _CGBP_NAMES)
+        if not cgbp and bench:
+            cgbp = int(round(bench * 0.92))  # эвристика: узкий жим ≈ 92% от обычного жима
+
+        # --- DEBUG: print detected 1RMs from anketa/user/history
+        try:
+            print("[1RM] bench=", bench, "kg; cgbp=", cgbp, "kg; squat=", squat, "kg; deadlift=", deadl, "kg; ohp=", ohp, "kg")
+        except Exception:
+            pass
+
+        # DEBUG: uncomment if you need to trace missing 1RMs
+        # print({
+        #     "bench": bench, "squat": squat, "deadlift": deadl, "ohp": ohp, "cgbp": cgbp,
+        #     "anketa_keys": list(anketa.keys()),
+        # })
+
+        # --- грудь
+        if "жим штанги лежа" in n and "узкий" not in n:
             return est_from_1rm(bench, reps)
         if "жим штанги на наклонной" in n or ("жим гантелей" in n and "наклон" in n):
             base = est_from_1rm(bench, reps)
             return int(base * 0.85) if base else None  # наклон обычно ~85% от плоской
-        if "сведение рук" in n:
+        if "сведение рук" in n or "кроссовер" in n:
+            # изолирующее относительно жима
             base = est_from_1rm(bench, reps)
             return int(base * 0.55) if base else 45
-        if "узкий жим" in n or "французский жим" in n or "разгибани" in n:
-            base = est_from_1rm(bench, reps)
-            return int(base * 0.65) if base else 35
 
+        # --- трицепс
+        if "узкий жим" in n:
+            return est_from_1rm(cgbp or bench, reps) or (est_from_1rm(bench, reps) if bench else None)
+
+        if "французский жим" in n:
+            base = est_from_1rm(cgbp or bench, reps)
+            return int(base * 0.55) if base else 30
+
+        if "разгибания на трицепс" in n or ("трицепс" in n and "разгиб" in n):
+            base = est_from_1rm(cgbp or bench, reps)
+            return int(base * 0.50) if base else 25
+
+        # --- ноги
         if "присед" in n:
             return est_from_1rm(squat, reps)
         if "жим ногами" in n:
             base = est_from_1rm(squat, reps)
             return int(base * 2.2) if base else 140  # тренажер обычно сильно больше
-
         if "сгибания ног" in n:
             base = est_from_1rm(squat, reps)
             return int(base * 0.55) if base else 35
@@ -148,6 +291,7 @@ def generate_plan(payload: Dict, today: Optional[str] = None) -> List[Dict]:
             base = est_from_1rm(squat, reps)
             return int(base * 0.9) if base else 80
 
+        # --- спина
         if "становая" in n:
             return est_from_1rm(deadl, reps)
         if "тяга штанги в наклоне" in n:
@@ -158,22 +302,25 @@ def generate_plan(payload: Dict, today: Optional[str] = None) -> List[Dict]:
             return int(base * 0.5) if base else 60
         if "подтягиван" in n:
             # оставим последний или ориентир по массе тела
-            bw = user.get("Вес") or 70
+            bw = user.get("Вес") or anketa.get("Вес") or 70
             return int(bw + 10)  # "вес" как масса/нагрузка в твоей схеме
 
+        # --- плечи
         if "жим штанги стоя" in n or "армейский жим" in n or "жим стоя" in n:
             return est_from_1rm(ohp, reps)
         if "мах" in n:
             base = est_from_1rm(ohp, reps)
             return int(base * 0.25) if base else 8
 
-        if "бицепс" in n:
+        # --- бицепс
+        if "бицепс" in n and "молотков" not in n:
             base = est_from_1rm(bench, reps)
             return int(base * 0.45) if base else 35
         if "молотков" in n:
             base = est_from_1rm(bench, reps)
             return int(base * 0.25) if base else 16
 
+        # --- пресс
         if "скручивания" in n or "подъем ног" in n:
             return 0
 
@@ -254,4 +401,4 @@ def generate_plan(payload: Dict, today: Optional[str] = None) -> List[Dict]:
                 "Количество повторений": int(reps),
             })
     return plan
-# --- /Local planner ----------------------------------------------------------
+# --- /Local planner -----------------------------------------------------------
