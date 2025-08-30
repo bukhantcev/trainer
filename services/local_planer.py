@@ -21,6 +21,18 @@ def generate_plan(payload: Dict, today: Optional[str] = None) -> List[Dict]:
     history = payload.get("история", []) or []
     anketa = payload.get("анкета", {}) or {}
 
+    # --- filter history by training_type to avoid mixing modes ---
+    def _norm_tt(x: Optional[str]) -> str:
+        return (str(x).strip().lower().replace("ё", "е")) if x is not None else ""
+
+    # keep only records of the current mode
+    # backward-compat: if mode is "strength", accept empty training_type as strength
+    if isinstance(history, list):
+        if mode == "strength":
+            history = [r for r in history if _norm_tt(r.get("training_type")) in ("", "strength")]
+        else:
+            history = [r for r in history if _norm_tt(r.get("training_type")) == mode]
+
     # ---------- helpers: normalize ----------
     def _norm_name(n: Optional[str]) -> str:
         return (n or "").strip().lower().replace("ё", "е")
@@ -247,6 +259,9 @@ def generate_plan(payload: Dict, today: Optional[str] = None) -> List[Dict]:
             if "сгибания ног" in n:
                 base = est_from_1rm(squat, reps)
                 return int(base * 0.55) if base else 35
+            if "разгибания ног" in n:
+                base = est_from_1rm(squat, reps)
+                return int(base * 0.60) if base else 40
             if "икр" in n or "носки" in n:
                 base = est_from_1rm(squat, reps)
                 return int(base * 0.9) if base else 80
@@ -300,38 +315,127 @@ def generate_plan(payload: Dict, today: Optional[str] = None) -> List[Dict]:
             else:            w = int(round(w_last * 1.06))
             return max(0, w)
 
+        def _pair_seen_count(pair: Tuple[str, str]) -> int:
+            cnt = 0
+            for r in history:
+                g = muscle_group(r.get("упражнение", "") or "")
+                if g in pair:
+                    cnt += 1
+            return cnt
+
+        def _last_pair_date(pair: Tuple[str, str]) -> Optional[str]:
+            """Вернуть последнюю дату, когда тренировали ИМЕННО эту пару (хотя бы одно упражнение из каждой группы пары на дате)."""
+            # Сгруппируем по датам
+            days: Dict[str, List[Dict]] = defaultdict(list)
+            for r in history:
+                d = r.get("дата")
+                if not d:
+                    continue
+                days[d].append(r)
+
+            last_d: Optional[str] = None
+            for d, recs in days.items():
+                groups = set()
+                for r in recs:
+                    g = muscle_group(r.get("упражнение", "") or "")
+                    if g:
+                        groups.add(g)
+                # требуем, чтобы на дате встретилась хотя бы 1 группа из каждой половины пары
+                if any(g in groups for g in (pair[0],)) and any(g in groups for g in (pair[1],)):
+                    if last_d is None or _to_date(d) > _to_date(last_d):
+                        last_d = d
+            return last_d
+
+        def _was_used(name_substring: str, recs: List[Dict]) -> bool:
+            """Проверка, была ли на дате вариация по подстроке названия упражнения."""
+            needle = name_substring.lower()
+            for r in recs:
+                if needle in (_norm_name(r.get("упражнение"))):
+                    return True
+            return False
+
+        def _rotation_for_pair(pair: Tuple[str, str]) -> int:
+            """0/1 ротация по последней СЕССИИ данной пары, чтобы чередовать вариации детерминированно."""
+            d = _last_pair_date(pair)
+            if not d:
+                # fallback: использовать счётчик встречаемости пар в истории
+                return _pair_seen_count(pair) % 2
+
+            # все записи на этой дате
+            day_recs = [r for r in history if r.get("дата") == d]
+
+            # CHEST+TRIS: если в прошлый раз был наклон гантели, то сейчас выбираем штангу (rot=1).
+            if pair == ("chest", "tris"):
+                if _was_used("жим гантелей на наклонной", day_recs):
+                    return 1
+                if _was_used("кроссовер", day_recs):
+                    return 1
+                if _was_used("французский жим", day_recs):
+                    return 1
+                return 0
+
+            # SHOULD+LEGS: если был акцент бицепс бедра (сгибания лёжа) — переключаемся на квадрицепс (разгибания) → rot=1
+            if pair == ("should", "legs"):
+                if _was_used("сгибания ног лёжа", day_recs):
+                    return 1
+                return 0
+
+            # BACK+BICEPS: вертикальная/горизонтальная уже чередуется отдельно; для бицепса меняем стартовый порядок
+            if pair == ("back", "biceps"):
+                if _was_used("подъем штанги на бицепс", day_recs):
+                    return 1
+                return 0
+
+            return 0
+
         def scheme_for_pair(pair: Tuple[str,str]) -> List[Tuple[str, List[int]]]:
+            # rotation index per pair по последней дате этой пары
+            rot = _rotation_for_pair(pair)
+
             if pair == ("chest","tris"):
-                used_dumb_incline = any("жим гантелей на наклонной" in _norm_name(r.get("упражнение","")) for r in history)
-                incline = "Жим штанги на наклонной скамье" if used_dumb_incline else "Жим гантелей на наклонной скамье"
+                # BASE (always): Жим штанги лежа, Узкий жим штанги лежа
+                # ISOLATION rotates: наклон (гантели/штанга), сведение/кроссовер, канат/французский
+                incline = "Жим гантелей на наклонной скамье" if rot == 0 else "Жим штанги на наклонной скамье"
+                fly_iso = "Сведение рук в тренажере" if rot == 0 else "Кроссовер верхних блоков"
+                tris_iso = "Разгибания на трицепс на канате" if rot == 0 else "Французский жим лёжа"
                 return [
-                    ("Жим штанги лежа",                 [8, 8, 7, 6]),
-                    (incline,                            [10, 9, 8]),
-                    ("Сведение рук в тренажере",        [12, 12, 10]),
-                    ("Узкий жим штанги лежа",           [8, 8, 7]),
-                    ("Разгибания на трицепс на канате", [12, 12, 10]),
+                    ("Жим штанги лежа",                 [8, 8, 7, 6]),   # BASE
+                    (incline,                            [10, 9, 8]),     # ROTATES
+                    (fly_iso,                            [12, 12, 10]),   # ROTATES
+                    ("Узкий жим штанги лежа",           [8, 8, 7]),     # BASE (трицепс)
+                    (tris_iso,                           [12, 12, 10]),   # ROTATES
                     ("Скручивания на канате",           [15, 15]),
                     ("Подъем ног в висе",               [12, 12]),
                 ]
+
             if pair == ("should","legs"):
+                # BASE (always): Приседания со штангой, Жим штанги стоя
+                # ISOLATION rotates: сгибания ног/разгибания ног; остальное фиксируем
+                leg_iso = "Сгибания ног лёжа в тренажере" if rot == 0 else "Разгибания ног в тренажере"
                 return [
-                    ("Приседания со штангой",            [8, 8, 7, 6]),
-                    ("Жим ногами в тренажере",           [12, 11, 10]),
-                    ("Сгибания ног лёжа в тренажере",    [12, 12, 10]),
-                    ("Подъемы на носки стоя в тренажере",[15, 13, 12]),
-                    ("Жим штанги стоя",                  [8, 8, 7, 6]),
-                    ("Махи гантелями в стороны",         [12, 10, 10]),
+                    ("Приседания со штангой",            [8, 8, 7, 6]),  # BASE
+                    ("Жим ногами в тренажере",           [12, 11, 10]),  # ACCESSORY (фиксирован)
+                    (leg_iso,                              [12, 12, 10]),  # ROTATES (ham/quad focus)
+                    ("Подъемы на носки стоя в тренажере",[15, 13, 12]),  # calves
+                    ("Жим штанги стоя",                  [8, 8, 7, 6]),  # BASE
+                    ("Махи гантелями в стороны",         [12, 10, 10]),  # delt isolation (фиксирован)
                     ("Скручивания на канате",            [15, 15]),
                 ]
+
+            # pair == ("back","biceps")
+            # BASE (always): Становая тяга, Тяга штанги в наклоне
+            # ISOLATION rotates: вертикальная/горизонтальная тяга уже чередуется; бицепс порядок меняем
             used_vert = any("тяга вертикального блока" in _norm_name(r.get("упражнение","")) for r in history)
             lat = "Тяга горизонтального блока" if used_vert else "Тяга вертикального блока"
+            biceps_a = ("Подъем штанги на бицепс", [8, 8, 8])
+            biceps_b = ("Молотковые сгибания гантелей", [10, 9, 8])
+            biceps_seq = [biceps_a, biceps_b] if rot == 0 else [biceps_b, biceps_a]
             return [
-                ("Становая тяга",                 [5, 5, 5, 5]),
-                ("Тяга штанги в наклоне",        [8, 8, 7]),
-                (lat,                             [10, 10, 9]),
+                ("Становая тяга",                 [5, 5, 5, 5]),   # BASE
+                ("Тяга штанги в наклоне",        [8, 8, 7]),     # BASE
+                (lat,                              [10, 10, 9]),   # ROTATES (vert/horiz)
                 ("Подтягивания с весом",          [8, 8, 6]),
-                ("Подъем штанги на бицепс",      [8, 8, 8]),
-                ("Молотковые сгибания гантелей", [10, 9, 8]),
+                *biceps_seq,
                 ("Скручивания на канате",        [15, 15]),
             ]
 
