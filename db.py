@@ -65,9 +65,20 @@ def init_db():
         target_reps INTEGER,
         actual_reps INTEGER,
         date TEXT,
+        training_type TEXT,
         FOREIGN KEY(workout_id) REFERENCES workouts(id) ON DELETE CASCADE
     )
     """)
+
+    # migration: ensure exercises.training_type exists
+    try:
+        info = conn.execute("PRAGMA table_info(exercises)").fetchall()
+        has_training_type = any(row[1] == "training_type" for row in info)
+        if not has_training_type:
+            conn.execute("ALTER TABLE exercises ADD COLUMN training_type TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     # ensure columns/indexes
     try:
         conn.execute("ALTER TABLE exercises ADD COLUMN date TEXT")

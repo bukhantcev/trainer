@@ -91,23 +91,43 @@ async def workouts_open(callback: CallbackQuery):
 async def new_training_local(message: Message):
     tg_id = message.from_user.id
     conn = get_connection(); cur = conn.cursor()
-    user = cur.execute("SELECT name, age, height, weight, goal, experience FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
-    user_info = dict(user) if user else {}
+    user = cur.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
+    user_dict = dict(user) if user else {}
+    # Try multiple possible column names for mode
+    mode_val = user_dict.get("training_type") or user_dict.get("mode") or user_dict.get("training_mode")
+    user_info = user_dict
     user_info_ru = {"Имя": user_info.get("name"), "Возраст": user_info.get("age"), "Рост": user_info.get("height"),
-                    "Вес": user_info.get("weight"), "Цель": user_info.get("goal"), "Опыт": user_info.get("experience")}
+                    "Вес": user_info.get("weight"), "Цель": user_info.get("goal"), "Опыт": user_info.get("experience"),
+                    "Режим": mode_val}
     since = (datetime.now(timezone.utc).date() - timedelta(days=30)).strftime("%Y-%m-%d")
-    cur.execute("""
-        SELECT w.date AS date, e.name AS exercise, e.set_index AS set_number,
-               e.weight AS weight, e.target_reps AS target_reps, e.actual_reps AS actual_reps
-        FROM workouts w JOIN exercises e ON e.workout_id = w.id
-        WHERE w.tg_id = ? AND w.date >= ?
-        ORDER BY w.date ASC, w.id ASC, e.set_index ASC
-    """, (tg_id, since))
+    if mode_val:
+        cur.execute(
+            """
+            SELECT w.date AS date, e.name AS exercise, e.set_index AS set_number,
+                   e.weight AS weight, e.target_reps AS target_reps, e.actual_reps AS actual_reps
+            FROM workouts w JOIN exercises e ON e.workout_id = w.id
+            WHERE w.tg_id = ? AND w.date >= ? AND e.training_type = ?
+            ORDER BY w.date ASC, w.id ASC, e.set_index ASC
+            """,
+            (tg_id, since, mode_val),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT w.date AS date, e.name AS exercise, e.set_index AS set_number,
+                   e.weight AS weight, e.target_reps AS target_reps, e.actual_reps AS actual_reps
+            FROM workouts w JOIN exercises e ON e.workout_id = w.id
+            WHERE w.tg_id = ? AND w.date >= ?
+            ORDER BY w.date ASC, w.id ASC, e.set_index ASC
+            """,
+            (tg_id, since),
+        )
     history_rows = [dict(r) for r in cur.fetchall()]
     history_ru = [{"дата": r["date"], "упражнение": r["exercise"], "подход": r["set_number"],
                    "вес": r["weight"], "целевые_повторения": r["target_reps"], "выполненные_повторения": r["actual_reps"]}
                   for r in history_rows]
-    payload = {"пользователь": user_info_ru, "история": history_ru}
+    print(history_ru)
+    payload = {"пользователь": user_info_ru, "история": history_ru, "режим": mode_val}
     ob = cur.execute(
         "SELECT bench_max_kg, cgbp_max_kg, squat_max_kg, pullups_reps, deadlift_max_kg, dips_reps, ohp_max_kg FROM users WHERE tg_id = ?",
         (tg_id,)
@@ -123,6 +143,7 @@ async def new_training_local(message: Message):
     }
     conn.close()
 
+    print(f"[DEBUG] Resolved training mode: {mode_val!r}")
     try:
         plan_items = generate_plan(payload)
     except Exception as e:
@@ -145,10 +166,13 @@ async def new_training_local(message: Message):
             weight = item.get("Вес"); weight = int(weight) if weight is not None else None
             target = item.get("Количество повторений"); target = int(target) if target is not None else None
             if not name or si is None: continue
-            cur2.execute("""
-                INSERT INTO exercises(workout_id,name,set_index,weight,target_reps,actual_reps,date)
-                VALUES(?,?,?,?,?,NULL,?)
-            """, (workout_id, name, si, weight, target, today_iso))
+            cur2.execute(
+                """
+                INSERT INTO exercises(workout_id,name,set_index,weight,target_reps,actual_reps,date,training_type)
+                VALUES(?,?,?,?,?,NULL,?,?)
+                """,
+                (workout_id, name, si, weight, target, today_iso, mode_val),
+            )
             inserted += 1
         except Exception as ex:
             print(f"[DB] Skip row: {ex} | {item}")
@@ -173,23 +197,41 @@ async def new_training_local(message: Message):
 async def new_training_ai(message: Message):
     tg_id = message.from_user.id
     conn = get_connection(); cur = conn.cursor()
-    user = cur.execute("SELECT name, age, height, weight, goal, experience FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
-    user_info = dict(user) if user else {}
+    user = cur.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
+    user_dict = dict(user) if user else {}
+    mode_val = user_dict.get("training_type") or user_dict.get("mode") or user_dict.get("training_mode")
+    user_info = user_dict
     user_info_ru = {"Имя": user_info.get("name"), "Возраст": user_info.get("age"), "Рост": user_info.get("height"),
-                    "Вес": user_info.get("weight"), "Цель": user_info.get("goal"), "Опыт": user_info.get("experience")}
+                    "Вес": user_info.get("weight"), "Цель": user_info.get("goal"), "Опыт": user_info.get("experience"),
+                    "Режим": mode_val}
     since = (datetime.now(timezone.utc).date() - timedelta(days=30)).strftime("%Y-%m-%d")
-    cur.execute("""
-        SELECT w.date AS date, e.name AS exercise, e.set_index AS set_number,
-               e.weight AS weight, e.target_reps AS target_reps, e.actual_reps AS actual_reps
-        FROM workouts w JOIN exercises e ON e.workout_id = w.id
-        WHERE w.tg_id = ? AND w.date >= ?
-        ORDER BY w.date ASC, w.id ASC, e.set_index ASC
-    """, (tg_id, since))
+    if mode_val:
+        cur.execute(
+            """
+            SELECT w.date AS date, e.name AS exercise, e.set_index AS set_number,
+                   e.weight AS weight, e.target_reps AS target_reps, e.actual_reps AS actual_reps
+            FROM workouts w JOIN exercises e ON e.workout_id = w.id
+            WHERE w.tg_id = ? AND w.date >= ? AND e.training_type = ?
+            ORDER BY w.date ASC, w.id ASC, e.set_index ASC
+            """,
+            (tg_id, since, mode_val),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT w.date AS date, e.name AS exercise, e.set_index AS set_number,
+                   e.weight AS weight, e.target_reps AS target_reps, e.actual_reps AS actual_reps
+            FROM workouts w JOIN exercises e ON e.workout_id = w.id
+            WHERE w.tg_id = ? AND w.date >= ?
+            ORDER BY w.date ASC, w.id ASC, e.set_index ASC
+            """,
+            (tg_id, since),
+        )
     history_rows = [dict(r) for r in cur.fetchall()]
     history_ru = [{"дата": r["date"], "упражнение": r["exercise"], "подход": r["set_number"],
                    "вес": r["weight"], "целевые_повторения": r["target_reps"], "выполненные_повторения": r["actual_reps"]}
                   for r in history_rows]
-    payload = {"пользователь": user_info_ru, "история": history_ru}
+    payload = {"пользователь": user_info_ru, "история": history_ru, "режим": mode_val}
     ob = cur.execute(
         "SELECT bench_max_kg, cgbp_max_kg, squat_max_kg, pullups_reps, deadlift_max_kg, dips_reps, ohp_max_kg FROM users WHERE tg_id = ?",
         (tg_id,)
@@ -216,6 +258,7 @@ async def new_training_ai(message: Message):
         await message.answer("Ошибка OpenAI: проверь ключ в .env (для AI-плана)")
         return
 
+    print(f"[DEBUG] Resolved training mode: {mode_val!r}")
     raw, items = ask_openai(payload, prompt_text)
     print("[OpenAI] RAW:\n", raw)
 
@@ -236,10 +279,13 @@ async def new_training_ai(message: Message):
             weight = it.get("Вес"); weight = int(weight) if weight is not None else None
             target = it.get("Количество повторений"); target = int(target) if target is not None else None
             if not name or si is None: continue
-            cur2.execute("""
-                INSERT INTO exercises(workout_id,name,set_index,weight,target_reps,actual_reps,date)
-                VALUES(?,?,?,?,?,NULL,?)
-            """, (workout_id, name, si, weight, target, today_iso))
+            cur2.execute(
+                """
+                INSERT INTO exercises(workout_id,name,set_index,weight,target_reps,actual_reps,date,training_type)
+                VALUES(?,?,?,?,?,NULL,?,?)
+                """,
+                (workout_id, name, si, weight, target, today_iso, mode_val),
+            )
             inserted += 1
         except Exception as ex:
             print(f"[DB] Skip row: {ex} | {it}")
@@ -400,12 +446,28 @@ async def plan_back(callback: CallbackQuery):
     if not cache:
         today = datetime.now(timezone.utc).date().strftime("%Y-%m-%d")
         conn = get_connection(); cur = conn.cursor()
-        cur.execute("""
-            SELECT DISTINCT e.name
-            FROM exercises e JOIN workouts w ON w.id = e.workout_id
-            WHERE w.tg_id = ? AND w.date = ?
-            ORDER BY e.name COLLATE NOCASE
-        """, (tg_id, today))
+        mrow = cur.execute("SELECT training_type FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
+        mode_val = mrow[0] if mrow and (len(mrow) > 0) else None
+        if mode_val:
+            cur.execute(
+                """
+                SELECT DISTINCT e.name
+                FROM exercises e JOIN workouts w ON w.id = e.workout_id
+                WHERE w.tg_id = ? AND w.date = ? AND e.training_type = ?
+                ORDER BY e.name COLLATE NOCASE
+                """,
+                (tg_id, today, mode_val),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT DISTINCT e.name
+                FROM exercises e JOIN workouts w ON w.id = e.workout_id
+                WHERE w.tg_id = ? AND w.date = ?
+                ORDER BY e.name COLLATE NOCASE
+                """,
+                (tg_id, today),
+            )
         names = [r[0] for r in cur.fetchall()]; conn.close()
         if not names:
             await callback.message.edit_text("На сегодня упражнений не найдено."); await callback.answer(); return

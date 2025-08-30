@@ -1,5 +1,5 @@
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from states import ProfileFSM, ProfileFullFSM, OnboardFSM
 from db import get_connection
@@ -9,11 +9,19 @@ from utils.parsing import parse_profile_update
 
 # Источник дефолтной инструкции из модуля prompt.py
 try:
-    from prompt import PROMPT as DEFAULT_PROMPT
+    from prompt import PROMPT, PROMPT_YOGA
 except Exception:
-    DEFAULT_PROMPT = ""
+    PROMPT = ""
+    PROMPT_YOGA = ""
 
 router = Router()
+
+# Нормализация и выбор дефолтного промпта по режиму
+_YOGA_ALIASES = {"йога", "пилатес", "йога/пилатес", "yoga", "pilates", "yoga/pilates"}
+
+def _default_prompt_for_mode(mode_value: str | None) -> str:
+    mode = (mode_value or "").strip().lower()
+    return PROMPT_YOGA if mode in _YOGA_ALIASES else PROMPT
 
 @router.message(F.text == "Посмотреть профиль")
 async def view_profile(message: Message):
@@ -31,34 +39,47 @@ async def view_profile(message: Message):
 async def edit_prompt_from_reply(message: Message, state: FSMContext):
     tg_id = message.from_user.id
     conn = get_connection()
-    row = conn.execute("SELECT prompt FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
+    row = conn.execute(
+        "SELECT prompt, training_type FROM users WHERE tg_id = ?",
+        (tg_id,)
+    ).fetchone()
     conn.close()
 
-    current_prompt = (row["prompt"] if row and row["prompt"] else None)
-    if current_prompt is None:
-        current_prompt = DEFAULT_PROMPT
+    user_prompt = (row["prompt"] if row and row["prompt"] else None)
+    mode_value = None
+    if row:
+        # используем только training_type
+        mode_value = row["training_type"] if "training_type" in row.keys() else None
+
+    current_prompt = user_prompt if user_prompt is not None else _default_prompt_for_mode(mode_value)
 
     await message.answer("Вот ваши инструкции:")
     await message.answer(current_prompt if current_prompt else "— пусто —")
     await state.set_state(ProfileFSM.edit_prompt)
-    await message.answer("Пришлите новый текст инструкции одним сообщением.\nМожно отправить /cancel для отмены или /default — чтобы вернуть дефолт из prompt.py.")
+    await message.answer("Пришлите новый текст инструкции одним сообщением.\nМожно отправить /cancel для отмены или /default — чтобы вернуть стандартный вариант.")
 
 @router.callback_query(F.data == "profile:edit_prompt")
 async def edit_prompt_from_inline(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     tg_id = callback.from_user.id
     conn = get_connection()
-    row = conn.execute("SELECT prompt FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
+    row = conn.execute(
+        "SELECT prompt, training_type FROM users WHERE tg_id = ?",
+        (tg_id,)
+    ).fetchone()
     conn.close()
 
-    current_prompt = (row["prompt"] if row and row["prompt"] else None)
-    if current_prompt is None:
-        current_prompt = DEFAULT_PROMPT
+    user_prompt = (row["prompt"] if row and row["prompt"] else None)
+    mode_value = None
+    if row:
+        mode_value = row["training_type"] if "training_type" in row.keys() else None
+
+    current_prompt = user_prompt if user_prompt is not None else _default_prompt_for_mode(mode_value)
 
     await callback.message.answer("Вот ваши инструкции:")
     await callback.message.answer(current_prompt if current_prompt else "— пусто —")
     await state.set_state(ProfileFSM.edit_prompt)
-    await callback.message.answer("Пришлите новый текст инструкции одним сообщением.\nМожно отправить /cancel для отмены или /default — чтобы вернуть дефолт.")
+    await callback.message.answer("Пришлите новый текст инструкции одним сообщением.\nМожно отправить /cancel для отмены или /default — чтобы вернуть стандартный вариант.")
 
 @router.message(ProfileFSM.edit_prompt)
 async def edit_prompt_save(message: Message, state: FSMContext):
@@ -102,6 +123,29 @@ async def edit_profile_cb(callback: CallbackQuery, state: FSMContext):
         "Варианты опыта: новичок, средний, продвинутый.\n"
         "Пол: мужской/женский. Рост и вес вводи целыми числами."
     )
+
+@router.callback_query(F.data == "profile:mode")
+async def choose_mode(callback: CallbackQuery):
+    # Показать инлайн-выбор режима
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💪 Силовая", callback_data="set_mode:strength")],
+        [InlineKeyboardButton(text="🧘 Йога/Пилатес", callback_data="set_mode:yoga")],
+    ])
+    await callback.message.answer("Выбери режим:", reply_markup=kb)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("set_mode:"))
+async def set_mode(callback: CallbackQuery):
+    data = (callback.data or "").split(":", 1)
+    mode = data[1] if len(data) == 2 else "strength"
+    human = "Силовая" if mode == "strength" else "Йога/Пилатес"
+
+    conn = get_connection(); cur = conn.cursor()
+    cur.execute("UPDATE users SET training_type = ? WHERE tg_id = ?", (mode, callback.from_user.id))
+    conn.commit(); conn.close()
+
+    await callback.message.answer(f"Режим установлен: {human} ✅")
+    await callback.answer()
 
 @router.message(ProfileFSM.wait_input)
 async def profile_update_input(message: Message, state: FSMContext):
